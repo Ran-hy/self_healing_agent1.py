@@ -1,2 +1,182 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+跨系统异常自愈 Agent (基于 CrewAI)
+功能：自动分析 RPA 任务失败日志 → 执行修复 → 验证结果 → 必要时升级人工
+"""
+
+import os
+import json
+from datetime import datetime
+from typing import Dict, Any
+from enum import Enum
+
+from dotenv import load_dotenv
+from crewai import Agent, Task, Crew, Process
+from crewai.tools import BaseTool
+from pydantic import BaseModel, Field
+
+# ================= 1. 加载环境变量 =================
+load_dotenv()
+
+# 必须配置的变量 (放在 .env 文件中)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+
+if not OPENAI_API_KEY:
+    raise ValueError("请在 .env 文件中设置 OPENAI_API_KEY")
+
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+os.environ["OPENAI_BASE_URL"] = OPENAI_BASE_URL
+
+# ================= 2. 数据模型 =================
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    RETRYING = "retrying"
+    HEALED = "healed"
+    ESCALATED = "escalated"
+
+class TaskLog(BaseModel):
+    task_id: str
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+    status: TaskStatus
+    error_type: str = ""
+    error_message: str = ""
+    context: Dict[str, Any] = Field(default_factory=dict)
+
+# ================= 3. 工具定义 (Tools) =================
+class ExecuteTaskTool(BaseTool):
+    """模拟执行跨系统RPA任务（可能成功或失败）"""
+    name: str = "execute_task_tool"
+    description: str = "执行指定的RPA任务，返回执行结果（成功/失败+错误信息）"
+
+    def _run(self, task_id: str) -> str:
+        print(f"   [工具] 执行任务 {task_id} ...")
+        # 模拟多种失败场景
+        if "timeout" in task_id:
+            return json.dumps({"status": "failed", "error": "TimeoutError", "message": "请求后端服务超时（30秒无响应）"})
+        if "field_change" in task_id:
+            return json.dumps({"status": "failed", "error": "FieldMappingError", "message": "字段映射失败：找不到 'customer_name'，实际字段是 'client_name'"})
+        if "auth_fail" in task_id:
+            return json.dumps({"status": "failed", "error": "AuthenticationError", "message": "认证失败：会话已过期"})
+        # 默认成功
+        return json.dumps({"status": "success", "message": "任务执行成功"})
+
+class QueryLogTool(BaseTool):
+    """模拟查询日志系统，获取详细错误上下文"""
+    name: str = "query_log_tool"
+    description: str = "根据任务ID查询详细日志，辅助根因分析"
+
+    def _run(self, task_id: str) -> str:
+        print(f"   [工具] 查询任务 {task_id} 的详细日志 ...")
+        if "timeout" in task_id:
+            log = {"log": "10:00:01 INFO 开始调用API...\n10:00:31 ERROR 请求超时，连接未关闭"}
+        elif "field_change" in task_id:
+            log = {"log": "10:00:02 INFO 解析响应JSON\n10:00:02 ERROR KeyError: 'customer_name'"}
+        else:
+            log = {"log": "10:00:00 INFO 尝试认证\n10:00:01 ERROR 401 Unauthorized - session expired"}
+        return json.dumps(log)
+
+class CreateJiraTicketTool(BaseTool):
+    """模拟创建人工工单"""
+    name: str = "create_jira_ticket_tool"
+    description: str = "当自动修复失败时，创建工单并升级给人工处理"
+
+    def _run(self, task_id: str, error: str, proposed_fix: str) -> str:
+        ticket_id = f"HEAL-{hash(task_id) % 10000}"
+        print(f"   [工具] 已创建人工工单: {ticket_id}（错误: {error}）")
+        return json.dumps({"status": "ticket_created", "ticket_id": ticket_id})
+
+# ================= 4. 创建 Agents =================
+error_analyst = Agent(
+    role="智能错误分析师",
+    goal="分析失败日志，定位根本原因并分类",
+    backstory="""你擅长分析RPA和API集成故障，能快速从日志中识别超时、认证失败、字段不匹配等问题。""",
+    tools=[QueryLogTool()],
+    llm=MODEL_NAME,
+    verbose=True,
+)
+
+fix_engineer = Agent(
+    role="自愈工程师",
+    goal="根据分析结果执行修复策略，使任务恢复",
+    backstory="""你拥有丰富的运维工具库：重试机制、动态字段映射、会话刷新等。知道什么错误用什么修复。""",
+    tools=[ExecuteTaskTool()],
+    llm=MODEL_NAME,
+    verbose=True,
+)
+
+quality_verifier = Agent(
+    role="质量保证官",
+    goal="验证修复后的结果，成功则闭环，失败则升级人工",
+    backstory="""你是系统稳定性的最后防线，失败时必须立刻升级，避免错误扩散。""",
+    tools=[CreateJiraTicketTool()],
+    llm=MODEL_NAME,
+    verbose=True,
+)
+
+# ================= 5. 定义任务 =================
+analysis_task = Task(
+    description=(
+        "分析以下任务失败日志：```{log_content}```\n"
+        "使用查询日志工具获取更多细节，然后输出一个JSON，包含：\n"
+        "- root_cause_type: 必须是 ['TimeoutError', 'AuthFailed', 'FieldMismatch'] 之一\n"
+        "- fix_plan: 简短描述应该如何修复（重试/改字段映射/刷新会话）"
+    ),
+    expected_output="JSON格式的根因分析和修复计划",
+    agent=error_analyst,
+)
+
+fix_task = Task(
+    description=(
+        "根据分析师的修复计划，执行具体修复：\n"
+        "- 如果是 TimeoutError → 调用 execute_task_tool 重试一次（传入原task_id）\n"
+        "- 如果是 FieldMismatch → 模拟更新映射后再次调用 execute_task_tool\n"
+        "- 如果是 AuthFailed → 模拟刷新令牌再重试\n"
+        "返回执行结果（成功/失败）。"
+    ),
+    expected_output="修复执行后的结果（JSON字符串）",
+    agent=fix_engineer,
+    context=[analysis_task],
+)
+
+verification_task = Task(
+    description=(
+        "检查修复任务返回的结果：\n"
+        "1. 如果结果中的 status 为 'success' → 输出 'Healing Success'，流程结束。\n"
+        "2. 如果仍为 'failed' → 调用 create_jira_ticket_tool 创建工单，并输出 'Healing Failed, Escalated'。"
+    ),
+    expected_output="最终结论：'Healing Success' 或 'Healing Failed, Escalated'",
+    agent=quality_verifier,
+    context=[fix_task],
+)
+
+# ================= 6. 组建 Crew 并运行 =================
+self_healing_crew = Crew(
+    agents=[error_analyst, fix_engineer, quality_verifier],
+    tasks=[analysis_task, fix_task, verification_task],
+    process=Process.sequential,
+    verbose=True,
+)
+
+if __name__ == "__main__":
+    # 测试案例：模拟一个超时失败的任务
+    test_log = TaskLog(
+        task_id="order_api_timeout_001",
+        status=TaskStatus.FAILED,
+        error_type="TimeoutError",
+        error_message="API 调用在 30 秒后超时"
+    )
+    print("\n🚨 监控到失败任务：", test_log.task_id)
+    print("📋 失败日志：", test_log.json(indent=2))
+    print("\n🤖 Agent 开始自愈流程...\n")
+
+    result = self_healing_crew.kickoff(inputs={"log_content": test_log.json()})
+
+    print("\n✅ 自愈流程结束，最终结果：")
+    print(result)
